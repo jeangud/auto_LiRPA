@@ -87,6 +87,8 @@ class Interval(tuple):
                 return 0, interval.ptb.eps, interval.ptb.ratio
             elif isinstance(interval.ptb, PerturbationLinear):
                 return torch.inf, 0.0
+            elif isinstance(interval.ptb, PerturbationPWL):
+                return torch.inf, 0.0
             else:
                 raise RuntimeError("get_perturbation() does not know how to handle {}".format(type(interval.ptb)))
         else:

@@ -601,6 +601,380 @@ class PerturbationLinear(Perturbation):
             raise NotImplementedError("Linear perturbation does not support forward mode.")
 
 
+class PerturbationPWL(Perturbation):
+    """Perturbation with 2-piece piecewise-linear bounds over a scalar param t.
+
+    Each input dimension x_i is bounded by:
+        L_i(t) <= x_i <= U_i(t),   t in [t_min, t_max]
+
+    where L_i and U_i are 2-piece linear functions with per-dimension,
+    per-bound breakpoints bp_lower_i and bp_upper_i (they may differ):
+
+        For the lower bound (breakpoint bp_lower_i):
+            Piece 0 (t in [t_min, bp_lower_i]):
+                L_i(t) = lower_A[b,0,i]*t + lower_b[b,0,i]
+            Piece 1 (t in [bp_lower_i, t_max]):
+                L_i(t) = lower_A[b,1,i]*t + lower_b[b,1,i]
+
+        For the upper bound (breakpoint bp_upper_i):
+            Piece 0 (t in [t_min, bp_upper_i]):
+                U_i(t) = upper_A[b,0,i]*t + upper_b[b,0,i]
+            Piece 1 (t in [bp_upper_i, t_max]):
+                U_i(t) = upper_A[b,1,i]*t + upper_b[b,1,i]
+
+    Args:
+        t_min (float): Global lower bound on parameter t.
+        t_max (float): Global upper bound on parameter t.
+        lower_breakpoints: (B, D) — per-dim breakpoint for the lower bound.
+        upper_breakpoints: (B, D) — per-dim breakpoint for the upper bound.
+        lower_A: (B, 2, D) — slopes for lower bound (2 pieces).
+        lower_b: (B, 2, D) — intercepts for lower bound (2 pieces).
+        upper_A: (B, 2, D) — slopes for upper bound (2 pieces).
+        upper_b: (B, 2, D) — intercepts for upper bound (2 pieces).
+        x_L, x_U: Optional pre-computed concrete bounds (B, D).
+    """
+
+    def __init__(self, t_min, t_max, *,
+                 lower_breakpoints, upper_breakpoints,
+                 lower_A, upper_A, lower_b, upper_b,
+                 x_L=None, x_U=None):
+        super(PerturbationPWL, self).__init__()
+
+        bp_lower = lower_breakpoints
+        bp_upper = upper_breakpoints
+
+        # --- Validation ---
+        if t_min >= t_max:
+            raise ValueError(f"t_min ({t_min}) must be < t_max ({t_max})")
+        if bp_lower.ndim != 2:
+            raise ValueError(
+                f"lower_breakpoints must be 2-D (B, D), "
+                f"got shape {bp_lower.shape}")
+        if bp_upper.shape != bp_lower.shape:
+            raise ValueError(
+                f"upper_breakpoints shape {bp_upper.shape} must match "
+                f"lower_breakpoints shape {bp_lower.shape}")
+        B, D = bp_lower.shape
+        for name, tensor in [('lower_A', lower_A), ('lower_b', lower_b),
+                              ('upper_A', upper_A), ('upper_b', upper_b)]:
+            if tensor.shape != (B, 2, D):
+                raise ValueError(
+                    f"{name} must have shape (B={B}, 2, D={D}), "
+                    f"got {tensor.shape}")
+        if not (bp_lower >= t_min).all() or not (bp_lower <= t_max).all():
+            raise ValueError("All lower breakpoints must be in [t_min, t_max]")
+        if not (bp_upper >= t_min).all() or not (bp_upper <= t_max).all():
+            raise ValueError("All upper breakpoints must be in [t_min, t_max]")
+
+        L0_bp = lower_A[:, 0] * bp_lower + lower_b[:, 0]
+        L1_bp = lower_A[:, 1] * bp_lower + lower_b[:, 1]
+        U0_bp = upper_A[:, 0] * bp_upper + upper_b[:, 0]
+        U1_bp = upper_A[:, 1] * bp_upper + upper_b[:, 1]
+
+        if not torch.allclose(L0_bp, L1_bp, atol=1e-4):
+            raise ValueError("PWL pieces for lower bound must be continuous at bp_lower.")
+        if not torch.allclose(U0_bp, U1_bp, atol=1e-4):
+            raise ValueError("PWL pieces for upper bound must be continuous at bp_upper.")
+
+        self.t_min = float(t_min)
+        self.t_max = float(t_max)
+        self.bp_lower = bp_lower                # (B, D)
+        self.bp_upper = bp_upper                # (B, D)
+        self.pwl_lower_A = lower_A              # (B, 2, D)
+        self.pwl_upper_A = upper_A              # (B, 2, D)
+        self.pwl_lower_b = lower_b              # (B, 2, D)
+        self.pwl_upper_b = upper_b              # (B, 2, D)
+        self.D = D
+
+        # --- Concrete bounds ---
+        if x_L is None or x_U is None:
+            x_L_c, x_U_c = self._compute_concrete_bounds()
+            self.x_L = x_L if x_L is not None else x_L_c
+            self.x_U = x_U if x_U is not None else x_U_c
+        else:
+            self.x_L = x_L
+            self.x_U = x_U
+
+        assert (self.x_L <= self.x_U + 1e-6).all(), (
+            f"x_L > x_U, max violation: {(self.x_L - self.x_U).max().item()}")
+
+    # -----------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------
+    def _eval_at_t(self, t):
+        """Evaluate L_i(t) and U_i(t) for all dims.
+
+        Args:
+            t: scalar or (B,) tensor.
+        Returns:
+            L, U: each (B, D).
+        """
+        t_tensor = torch.as_tensor(t, dtype=self.bp_lower.dtype, device=self.bp_lower.device)
+        if t_tensor.ndim == 0:
+            t_tensor = t_tensor.expand(self.bp_lower.shape[0])  # (B,)
+
+        # Independent masks: True where piece 0 applies (t <= bp_i)
+        mask_L = (t_tensor.unsqueeze(-1) <= self.bp_lower)  # (B, D)
+        mask_U = (t_tensor.unsqueeze(-1) <= self.bp_upper)  # (B, D)
+
+        t_exp = t_tensor.unsqueeze(-1)  # (B, 1)
+        L0 = self.pwl_lower_A[:, 0] * t_exp + self.pwl_lower_b[:, 0]  # (B,D)
+        L1 = self.pwl_lower_A[:, 1] * t_exp + self.pwl_lower_b[:, 1]
+        U0 = self.pwl_upper_A[:, 0] * t_exp + self.pwl_upper_b[:, 0]
+        U1 = self.pwl_upper_A[:, 1] * t_exp + self.pwl_upper_b[:, 1]
+
+        L = torch.where(mask_L, L0, L1)
+        U = torch.where(mask_U, U0, U1)
+        return L, U
+
+    def _compute_concrete_bounds(self):
+        """Concrete box bounds by evaluating at t_min, t_max, and each bp."""
+        L_min, U_min = self._eval_at_t(self.t_min)
+        L_max, U_max = self._eval_at_t(self.t_max)
+
+        # For bp evaluation, each dim uses its own breakpoint value.
+        # L is naturally continuous at bp_lower (piece 0 == piece 1 there).
+        L_bp = self.pwl_lower_A[:, 0] * self.bp_lower + self.pwl_lower_b[:, 0]
+        U_bp = self.pwl_upper_A[:, 0] * self.bp_upper + self.pwl_upper_b[:, 0]
+
+        x_L = torch.min(torch.min(L_min, L_bp), L_max)
+        x_U = torch.max(torch.max(U_min, U_bp), U_max)
+        return x_L, x_U
+
+
+    # -----------------------------------------------------------------
+    # Concretize (backward mode)
+    # -----------------------------------------------------------------
+    def concretize(self, x, A, sign=-1, aux=None):
+        """Concretize bounds given backward A matrix.
+
+        For sign=-1 (lower): compute min_{t,x} A·x  s.t. L(t)<=x<=U(t)
+        For sign=+1 (upper): compute max_{t,x} A·x  s.t. L(t)<=x<=U(t)
+
+        The objective is piecewise-linear in t with kinks at the
+        per-dimension breakpoints. Its optimum is at one of the D+2
+        candidate points {t_min, bp_1,...,bp_D, t_max}. We evaluate at
+        each candidate and take the best.
+
+        Supports three A representations:
+          - torch.Tensor (dense matrix, shape (B, H, D))
+          - eyeC (identity matrix)
+          - Patches (sparse convolutional representation)
+
+        Args:
+            x: center input tensor (B, *input_shape).
+            A: backward coefficients — Tensor, eyeC, or Patches.
+            sign: -1 for lower, +1 for upper.
+        Returns:
+            bound: (B, H) for dense/eyeC, or patches-shaped output.
+        """
+        if A is None:
+            return None
+
+        if isinstance(A, eyeC):
+            return self._concretize_identity(sign)
+        elif isinstance(A, Patches):
+            ret = self._concretize_patches(x, A, sign)
+            if ret.ndim > 2:
+                ret = ret.reshape(A.shape[1], -1)
+            return ret
+        else:
+            return self._concretize_matrix(A, sign)
+
+    def _concretize_identity(self, sign):
+        """Concretize when A is the identity (eyeC).
+
+        With A = I the bound is simply min_t L(t) = x_L (for lower)
+        or max_t U(t) = x_U (for upper), already pre-computed.
+        """
+        if sign == -1:
+            return self.x_L.reshape(self.x_L.shape[0], -1)
+        else:
+            return self.x_U.reshape(self.x_U.shape[0], -1)
+
+    def _concretize_matrix(self, A, sign):
+        """Original dense-matrix concretize path.
+
+        Args:
+            A: (B, H, D) dense backward coefficients.
+            sign: -1 for lower, +1 for upper.
+        Returns:
+            bound: (B, H).
+        """
+        B, H, D = A.shape
+        if D == 1 and self.D > 1:
+            # Forward mode concretization: A is the coefficient for the 1D scalar t
+            A_pos = A.clamp(min=0)
+            A_neg = A.clamp(max=0)
+            if sign == -1:
+                return (A_pos * self.t_min + A_neg * self.t_max).squeeze(-1)
+            else:
+                return (A_pos * self.t_max + A_neg * self.t_min).squeeze(-1)
+
+        A_pos = A.clamp(min=0)  # (B, H, D)
+        A_neg = A.clamp(max=0)  # (B, H, D)
+
+        def _bound_at_t(L, U):
+            """Given L,U of shape (B,D), compute bound(t) for all H."""
+            if sign == -1:
+                # min: pick L where A>=0, U where A<0
+                return (A_pos * L.unsqueeze(1) +
+                        A_neg * U.unsqueeze(1)).sum(dim=-1)  # (B, H)
+            else:
+                return (A_pos * U.unsqueeze(1) +
+                        A_neg * L.unsqueeze(1)).sum(dim=-1)
+
+        # Evaluate at t_min and t_max
+        L_min, U_min = self._eval_at_t(self.t_min)
+        L_max, U_max = self._eval_at_t(self.t_max)
+        best = _bound_at_t(L_min, U_min)
+        cand = _bound_at_t(L_max, U_max)
+        if sign == -1:
+            best = torch.min(best, cand)
+        else:
+            best = torch.max(best, cand)
+
+        # Evaluate at each per-dimension breakpoint (both lower and upper).
+        # bp_lower[:, d] / bp_upper[:, d] are candidate kinks for dim d. When we
+        # evaluate at t = bp_*[b, d], for OTHER dims j != d we re-evaluate L_j(t)
+        # and U_j(t) according to their own bp_lower_j / bp_upper_j masks. We
+        # process one candidate at a time to keep memory O(B*D).
+        for d in range(D):
+            for bp_tensor in (self.bp_lower, self.bp_upper):
+                t_d = bp_tensor[:, d]  # (B,)
+                L_d, U_d = self._eval_at_t(t_d)  # (B, D)
+                cand = _bound_at_t(L_d, U_d)
+                if sign == -1:
+                    best = torch.min(best, cand)
+                else:
+                    best = torch.max(best, cand)
+
+        return best
+
+    def _concretize_patches(self, x, A, sign):
+        """Concretize bounds when A is a Patches object.
+
+        Uses the center/diff decomposition:
+            min_x A·x  s.t. L<=x<=U  =  A·center - |A|·diff
+        where center = (L+U)/2, diff = (U-L)/2.
+
+        This avoids materializing the full dense A matrix by using
+        Patches.matmul() which operates via efficient unfolding.
+
+        Args:
+            x: center input tensor (B, C, H, W).
+            A: Patches object.
+            sign: -1 for lower, +1 for upper.
+        Returns:
+            bound: (B, out_c, out_h, out_w) or (B, unstable_size).
+        """
+        spatial_shape = x.shape  # (B, C, H, W)
+
+        def _bound_at_t_patches(L, U):
+            """Compute bound at a candidate t using patches matmul."""
+            # L, U are flat (B, D). Reshape to spatial dims.
+            L_spatial = L.view(spatial_shape)
+            U_spatial = U.view(spatial_shape)
+
+            center = (U_spatial + L_spatial) / 2.0
+            diff = (U_spatial - L_spatial) / 2.0
+
+            if A.identity == 1:
+                # Identity patches: A·x = x
+                return center + sign * diff
+            else:
+                bound = A.matmul(center)
+                bound_diff = A.matmul(diff, patch_abs=True)
+                return bound + sign * bound_diff
+
+        # Evaluate at t_min and t_max
+        L_min, U_min = self._eval_at_t(self.t_min)
+        L_max, U_max = self._eval_at_t(self.t_max)
+        best = _bound_at_t_patches(L_min, U_min)
+        cand = _bound_at_t_patches(L_max, U_max)
+        if sign == -1:
+            best = torch.min(best, cand)
+        else:
+            best = torch.max(best, cand)
+
+        # Evaluate at each per-dimension breakpoint (both lower and upper).
+        for d in range(self.D):
+            for bp_tensor in (self.bp_lower, self.bp_upper):
+                t_d = bp_tensor[:, d]  # (B,)
+                L_d, U_d = self._eval_at_t(t_d)  # (B, D)
+                cand = _bound_at_t_patches(L_d, U_d)
+                if sign == -1:
+                    best = torch.min(best, cand)
+                else:
+                    best = torch.max(best, cand)
+
+        return best
+
+    # -----------------------------------------------------------------
+    # Init (for both backward and forward mode)
+    # -----------------------------------------------------------------
+    def init(self, x, aux=None, forward=False):
+        if not forward:
+            return LinearBound(
+                None, None, None, None, self.x_L, self.x_U), x, None
+
+        # Forward mode: the perturbation variable is the scalar t.
+        # dim_in = 1.  We compute a linear relaxation of the PWL envelope:
+        #   lw * t + lb <= x_i <= uw * t + ub   for all t in [t_min, t_max]
+        #
+        # For the LOWER bound on x_i (which is L_i(t), a 2-piece PWL):
+        #   lw_i, lb_i = tightest linear under-approximation of L_i(t).
+        #   This is the chord connecting (t_min, L_i(t_min)) to (t_max, L_i(t_max)).
+        #   (Works because the chord of a PWL function lower-bounds it if
+        #    the function is concave, and we take the min of chord and pieces.)
+        #
+        # For the UPPER bound on x_i (U_i(t)):
+        #   uw_i, ub_i = tightest linear over-approximation of U_i(t).
+
+        B, D = self.bp_lower.shape
+        t0, t1 = self.t_min, self.t_max
+        dt = t1 - t0
+
+        # Evaluate L and U at endpoints and breakpoint
+        L_at_t0 = self.pwl_lower_A[:, 0] * t0 + self.pwl_lower_b[:, 0]  # (B,D)
+        L_at_t1 = self.pwl_lower_A[:, 1] * t1 + self.pwl_lower_b[:, 1]
+        U_at_t0 = self.pwl_upper_A[:, 0] * t0 + self.pwl_upper_b[:, 0]
+        U_at_t1 = self.pwl_upper_A[:, 1] * t1 + self.pwl_upper_b[:, 1]
+
+        L_at_bp_lower = self.pwl_lower_A[:, 0] * self.bp_lower + self.pwl_lower_b[:, 0]
+        U_at_bp_upper = self.pwl_upper_A[:, 0] * self.bp_upper + self.pwl_upper_b[:, 0]
+
+        # Chord slope and intercept for lower bound (linear under-approx)
+        lw = ((L_at_t1 - L_at_t0) / dt).unsqueeze(1)  # (B, 1, D)
+        lb = (L_at_t0 - lw.squeeze(1) * t0)            # (B, D)
+
+        # Shift chord down if it exceeds L(bp_lower) to ensure it strictly lower bounds
+        L_chord_at_bp = lw.squeeze(1) * self.bp_lower + lb
+        L_error = torch.clamp(L_chord_at_bp - L_at_bp_lower, min=0.0)
+        lb = lb - L_error
+
+        # Chord for upper bound (linear over-approx)
+        uw = ((U_at_t1 - U_at_t0) / dt).unsqueeze(1)  # (B, 1, D)
+        ub = (U_at_t0 - uw.squeeze(1) * t0)            # (B, D)
+
+        # Shift chord up if it is below U(bp_upper) to ensure it strictly upper bounds
+        U_chord_at_bp = uw.squeeze(1) * self.bp_upper + ub
+        U_error = torch.clamp(U_at_bp_upper - U_chord_at_bp, min=0.0)
+        ub = ub + U_error
+
+        # Parameter range as x_L, x_U for the 1-D perturbation variable
+        t_L = torch.full((B, 1), t0, dtype=self.bp_lower.dtype, device=self.bp_lower.device)
+        t_U = torch.full((B, 1), t1, dtype=self.bp_lower.dtype, device=self.bp_lower.device)
+
+        return LinearBound(
+            lw, lb, uw, ub, self.x_L, self.x_U,
+            x_L=t_L, x_U=t_U), x, None
+
+    def __repr__(self):
+        return (f'PerturbationPWL(D={self.D}, '
+                f't_range=[{self.t_min:.4f}, {self.t_max:.4f}])')
+
+
 class PerturbationSynonym(Perturbation):
     def __init__(self, budget, eps=1.0, use_simple=False):
         super(PerturbationSynonym, self).__init__()
