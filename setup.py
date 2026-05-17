@@ -44,7 +44,7 @@ setup(
         f'torchvision>={torchvision_version_l},<{torchvision_version_u}',
         'numpy>=1.20',
         'packaging>=20.0',
-        'pytest==8.1.1',
+        'pytest>=8.1.1',
         'pylint>=2.15',
         'pytest-order>=1.0.0',
         'pytest-mock>=3.14',
