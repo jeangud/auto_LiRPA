@@ -20,7 +20,7 @@ import os
 import numpy as np
 import torch
 from .utils import logger, eyeC
-from .patches import Patches, patches_to_matrix
+from .patches import Patches, patches_to_matrix, is_shape_used
 from .linear_bound import LinearBound
 
 from .concretize_func import constraints_solving, sort_out_constr_batches, construct_constraints
@@ -752,9 +752,11 @@ class PerturbationPWL(Perturbation):
         For sign=+1 (upper): compute max_{t,x} A·x  s.t. L(t)<=x<=U(t)
 
         The objective is piecewise-linear in t with kinks at the
-        per-dimension breakpoints. Its optimum is at one of the D+2
-        candidate points {t_min, bp_1,...,bp_D, t_max}. We evaluate at
-        each candidate and take the best.
+        per-dimension breakpoints of the lower and of the upper bound. Its
+        optimum is at one of the 2D+2 candidate points
+        {t_min, bp_lower_1..D, bp_upper_1..D, t_max}. The objective is
+        evaluated at all of them at once (see `_concretize_matrix`) and
+        the best value is returned.
 
         Supports three A representations:
           - torch.Tensor (dense matrix, shape (B, H, D))
@@ -793,13 +795,100 @@ class PerturbationPWL(Perturbation):
             return self.x_U.reshape(self.x_U.shape[0], -1)
 
     def _concretize_matrix(self, A, sign):
-        """Original dense-matrix concretize path.
+        """Dense-matrix concretize path.
+
+        For sign=-1 the objective for output h at parameter t is
+            g_h(t) = sum_j [ A+_hj * L_j(t) + A-_hj * U_j(t) ]
+        (L and U swapped for sign=+1). Each of the 2D terms is linear in t
+        on either side of its own breakpoint:
+            c * (a0 * t + b0)  for t <= bp,     c * (a1 * t + b1)  for t > bp.
+        With the terms sorted by breakpoint, the terms past their
+        breakpoint at a given t are a prefix of that order, so
+            g_h(t) = t * (S0_h + P_h[k]) + (T0_h + Q_h[k]),
+        where S0, T0 sum c*a0 and c*b0 over all terms, P and Q are the
+        prefix sums of c*(a1-a0) and c*(b1-b0), and k is the number of
+        breakpoints strictly below t. One sort and two prefix sums give g
+        at every candidate t, instead of one pass over the D inputs per
+        candidate. Sums are accumulated in double precision.
 
         Args:
             A: (B, H, D) dense backward coefficients.
             sign: -1 for lower, +1 for upper.
         Returns:
             bound: (B, H).
+        """
+        B, H, D = A.shape
+        if D == 1 and self.D > 1:
+            # Forward mode concretization: A is the coefficient for the 1D scalar t
+            A_pos = A.clamp(min=0)
+            A_neg = A.clamp(max=0)
+            if sign == -1:
+                return (A_pos * self.t_min + A_neg * self.t_max).squeeze(-1)
+            else:
+                return (A_pos * self.t_max + A_neg * self.t_min).squeeze(-1)
+
+        work = torch.float64
+        bp = torch.cat([self.bp_lower, self.bp_upper], dim=1)       # (B, 2D)
+        order = torch.argsort(bp, dim=1)
+        bp_sorted = torch.gather(bp, 1, order)
+
+        def _sorted_terms(lower, upper):
+            return torch.gather(
+                torch.cat([lower, upper], dim=1).to(work), 1, order)
+
+        # Piece 0 of every term, and what changes past its breakpoint
+        a0 = _sorted_terms(self.pwl_lower_A[:, 0], self.pwl_upper_A[:, 0])
+        b0 = _sorted_terms(self.pwl_lower_b[:, 0], self.pwl_upper_b[:, 0])
+        da = _sorted_terms(self.pwl_lower_A[:, 1], self.pwl_upper_A[:, 1]) - a0
+        db = _sorted_terms(self.pwl_lower_b[:, 1], self.pwl_upper_b[:, 1]) - b0
+
+        # Candidates, in the precision the bounds are stored in:
+        # t_min, every breakpoint, t_max                     (B, 2D + 2)
+        ends = bp.new_tensor([self.t_min, self.t_max]).expand(B, 2)
+        cand = torch.cat([ends[:, :1], bp_sorted, ends[:, 1:]], dim=1)
+        # Number of breakpoints strictly below each candidate: those terms
+        # are on piece 1 (piece 0 applies for t <= bp, as in `_eval_at_t`)
+        num_past = torch.searchsorted(bp_sorted, cand, right=False)
+        cand = cand.to(work).unsqueeze(1)                            # (B, 1, 2D+2)
+
+        best = A.new_empty(B, H)
+        # Bound the size of the (B, rows, 2D) temporaries
+        rows = max(1, int(2 ** 22 // max(1, B * 2 * D)))
+        for start in range(0, H, rows):
+            A_c = A[:, start:start + rows].to(work)                  # (B, h, D)
+            A_pos = A_c.clamp(min=0)
+            A_neg = A_c.clamp(max=0)
+            # Coefficient of L_j(t), then of U_j(t)
+            if sign == -1:
+                coef = torch.cat([A_pos, A_neg], dim=2)              # (B, h, 2D)
+            else:
+                coef = torch.cat([A_neg, A_pos], dim=2)
+            index = order.unsqueeze(1).expand(-1, coef.shape[1], -1)
+            coef = torch.gather(coef, 2, index)
+
+            slope0 = (coef * a0.unsqueeze(1)).sum(dim=-1, keepdim=True)
+            const0 = (coef * b0.unsqueeze(1)).sum(dim=-1, keepdim=True)
+            zero = coef.new_zeros(B, coef.shape[1], 1)
+            slope = torch.cat(
+                [zero, torch.cumsum(coef * da.unsqueeze(1), dim=-1)], dim=-1)
+            const = torch.cat(
+                [zero, torch.cumsum(coef * db.unsqueeze(1), dim=-1)], dim=-1)
+
+            index = num_past.unsqueeze(1).expand(-1, coef.shape[1], -1)
+            values = (cand * (slope0 + torch.gather(slope, 2, index))
+                      + const0 + torch.gather(const, 2, index))      # (B, h, 2D+2)
+            if sign == -1:
+                best[:, start:start + rows] = values.min(dim=-1).values.to(A.dtype)
+            else:
+                best[:, start:start + rows] = values.max(dim=-1).values.to(A.dtype)
+
+        return best
+
+    def _concretize_matrix_loop(self, A, sign):
+        """Reference for `_concretize_matrix`: one pass per candidate t.
+
+        Slow (2D+2 passes over the inputs); kept to test the vectorized
+        path against.
         """
         B, H, D = A.shape
         if D == 1 and self.D > 1:
@@ -853,6 +942,59 @@ class PerturbationPWL(Perturbation):
 
     def _concretize_patches(self, x, A, sign):
         """Concretize bounds when A is a Patches object.
+
+        The patches are expanded to a dense (B, H, D) matrix (H outputs, or
+        only the unstable ones for sparse patches) and handed to
+        `_concretize_matrix`.
+
+        Args:
+            x: center input tensor (B, C, H, W).
+            A: Patches object.
+            sign: -1 for lower, +1 for upper.
+        Returns:
+            bound: (B, out_c, out_h, out_w) or (B, unstable_size).
+        """
+        if A.identity == 1:
+            # Identity patches: A·x = x, so the bound is min_t L(t) or
+            # max_t U(t) for every input, reached at an end or a breakpoint.
+            x_L, x_U = self._compute_concrete_bounds()
+            return (x_L if sign == -1 else x_U).view(x.shape)
+        if is_shape_used(A.output_padding):
+            # `Patches.to_matrix` does not support output padding
+            return self._concretize_patches_loop(x, A, sign)
+
+        # Expand a limited number of outputs at a time: the dense matrix has
+        # D entries per output.
+        patches = A.patches
+        sparse = A.unstable_idx is not None
+        if sparse:
+            rows_per_slice = 1
+        else:
+            # (out_c, B, out_h, out_w, ...): one slice is one output channel
+            rows_per_slice = patches.shape[2] * patches.shape[3]
+        step = max(1, int(2 ** 26 // max(1, self.D * rows_per_slice)))
+        bounds = []
+        for start in range(0, patches.shape[0], step):
+            stop = start + step
+            matrix = patches_to_matrix(
+                patches[start:stop], x.shape, A.stride, A.padding,
+                A.output_shape,
+                tuple(idx[start:stop] for idx in A.unstable_idx) if sparse else None,
+                A.inserted_zeros)              # (B, rows, C, H_in, W_in)
+            B, rows = matrix.shape[:2]
+            bounds.append(
+                self._concretize_matrix(matrix.reshape(B, rows, -1), sign))
+        bound = torch.cat(bounds, dim=1)
+        if not sparse:
+            bound = bound.view(
+                bound.shape[0], patches.shape[0], patches.shape[2], patches.shape[3])
+        return bound
+
+    def _concretize_patches_loop(self, x, A, sign):
+        """Reference for `_concretize_patches`: one pass per candidate t.
+
+        Slow (2D+2 `Patches.matmul` pairs); kept to test the vectorized
+        path against, and for patches that cannot be expanded to a matrix.
 
         Uses the center/diff decomposition:
             min_x A·x  s.t. L<=x<=U  =  A·center - |A|·diff

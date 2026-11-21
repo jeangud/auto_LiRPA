@@ -812,5 +812,145 @@ class TestPerturbationPWL(unittest.TestCase):
                             f"seed={seed}: ub < exact_ub by "
                             f"{(exact_ub - ub).max().item():.4f}")
 
+    # ──────────────────────────────────────────────────────────────────
+    # Vectorized concretization against the one-candidate-at-a-time loops
+    # ──────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _random_pwl(B, D, dtype, seed, t_min=-0.3, t_max=0.7):
+        """Continuous 2-piece bounds with independent lower/upper breakpoints,
+        including repeated breakpoints and breakpoints at both ends."""
+        g = torch.Generator().manual_seed(seed)
+        def rand(*shape):
+            return torch.rand(*shape, generator=g, dtype=dtype)
+        def pieces(bp, offset):
+            A = rand(B, 2, D) * 4 - 2
+            b = torch.empty(B, 2, D, dtype=dtype)
+            b[:, 0] = rand(B, D) + offset
+            b[:, 1] = A[:, 0] * bp + b[:, 0] - A[:, 1] * bp   # continuous at bp
+            return A, b
+        bp_lower = rand(B, D) * (t_max - t_min) + t_min
+        bp_upper = rand(B, D) * (t_max - t_min) + t_min
+        # Ties, and breakpoints on the ends of the interval
+        bp_lower[:, : D // 4] = bp_lower[:, :1]
+        bp_upper[:, : D // 8] = bp_lower[:, :1]
+        bp_lower[:, -1] = t_min
+        bp_upper[:, -1] = t_max
+        bp_upper[:, -2] = t_min
+        lower_A, lower_b = pieces(bp_lower, -10.0)
+        upper_A, upper_b = pieces(bp_upper, 10.0)
+        return PerturbationPWL(
+            t_min, t_max, lower_breakpoints=bp_lower, upper_breakpoints=bp_upper,
+            lower_A=lower_A, upper_A=upper_A, lower_b=lower_b, upper_b=upper_b)
+
+    @torch.no_grad()
+    def test_concretize_matrix_matches_candidate_loop(self):
+        """The vectorized dense concretization returns the bounds of the
+        loop over the 2D+2 candidate parameters."""
+        for dtype, atol in ((torch.float64, 1e-9), (torch.float32, 2e-3)):
+            for seed, (B, H, D) in enumerate([(1, 5, 12), (3, 7, 40), (2, 1, 9)]):
+                ptb = self._random_pwl(B, D, dtype, seed)
+                torch.manual_seed(seed)
+                A = torch.randn(B, H, D, dtype=dtype)
+                A[:, :, ::5] = 0.0
+                for sign in (-1, +1):
+                    fast = ptb._concretize_matrix(A, sign)
+                    slow = ptb._concretize_matrix_loop(A, sign)
+                    self.assertEqual(fast.shape, slow.shape)
+                    self.assertEqual(fast.dtype, slow.dtype)
+                    self.assertTrue(
+                        torch.allclose(fast, slow, rtol=0, atol=atol),
+                        f"{dtype} seed={seed} sign={sign}: max diff "
+                        f"{(fast - slow).abs().max().item():.3e}")
+
+    @torch.no_grad()
+    def test_concretize_matrix_is_exact_on_dense_grid(self):
+        """No parameter value gives a better objective than the returned one,
+        and the returned one is reached."""
+        B, H, D = 2, 6, 15
+        ptb = self._random_pwl(B, D, torch.float64, seed=5)
+        torch.manual_seed(5)
+        A = torch.randn(B, H, D, dtype=torch.float64)
+        A_pos, A_neg = A.clamp(min=0), A.clamp(max=0)
+        grid = torch.linspace(ptb.t_min, ptb.t_max, 20001, dtype=torch.float64)
+        lows, highs = [], []
+        for t in grid:
+            L, U = ptb._eval_at_t(t.item())
+            lows.append((A_pos * L.unsqueeze(1) + A_neg * U.unsqueeze(1)).sum(-1))
+            highs.append((A_pos * U.unsqueeze(1) + A_neg * L.unsqueeze(1)).sum(-1))
+        grid_low = torch.stack(lows).min(dim=0).values
+        grid_high = torch.stack(highs).max(dim=0).values
+        low = ptb._concretize_matrix(A, -1)
+        high = ptb._concretize_matrix(A, +1)
+        self.assertTrue((low <= grid_low + 1e-9).all())
+        self.assertTrue((high >= grid_high - 1e-9).all())
+        # The grid is fine enough to come within 1e-2 of the optimum
+        self.assertTrue((grid_low - low).max() < 1e-2)
+        self.assertTrue((high - grid_high).max() < 1e-2)
+
+    @torch.no_grad()
+    def test_concretize_patches_matches_candidate_loop(self):
+        """CROWN bounds of CNNs in patches mode (dense and sparse patches) are
+        the same with the vectorized concretization and with the loops."""
+        class SmallCNN(nn.Module):
+            # Same layout as the LARD classifier of the homography experiments
+            def __init__(self):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Conv2d(3, 4, 4, stride=2, padding=1), nn.ReLU(),
+                    nn.Conv2d(4, 8, 4, stride=2, padding=1), nn.ReLU(),
+                    nn.Flatten(), nn.Linear(8 * 4 * 4, 10), nn.ReLU(),
+                    nn.Linear(10, 4))
+            def forward(self, x):
+                return self.net(x)
+
+        B, C, H, W = 1, 3, 16, 16
+        calls = {'patches': 0, 'sparse': 0, 'dense': 0}
+        fast_patches = PerturbationPWL._concretize_patches
+        fast_matrix = PerturbationPWL._concretize_matrix
+
+        def counting_patches(self_, x, A, sign):
+            calls['patches'] += 1
+            calls['sparse' if A.unstable_idx is not None else 'dense'] += 1
+            return fast_patches(self_, x, A, sign)
+
+        for seed in range(6):
+            torch.manual_seed(seed)
+            model = SmallCNN().double()
+            ptb = self._random_pwl(B, C * H * W, torch.float64, seed, 0.0, 0.05)
+            # Narrow the gap between the bounds: with the wider one every
+            # ReLU is unstable (dense patches), with the narrower one only
+            # some are (sparse patches, restricted to the unstable ones)
+            gap = 9.9 if seed % 2 else 9.999
+            ptb.pwl_lower_b += gap
+            ptb.pwl_upper_b -= gap
+            ptb.x_L, ptb.x_U = ptb._compute_concrete_bounds()
+            ptb.x_L = ptb.x_L.view(B, C, H, W)
+            ptb.x_U = ptb.x_U.view(B, C, H, W)
+            x_center = (ptb.x_L + ptb.x_U) / 2
+            results = {}
+            for name in ('fast', 'loop'):
+                try:
+                    if name == 'loop':
+                        PerturbationPWL._concretize_patches = (
+                            PerturbationPWL._concretize_patches_loop)
+                        PerturbationPWL._concretize_matrix = (
+                            PerturbationPWL._concretize_matrix_loop)
+                    else:
+                        PerturbationPWL._concretize_patches = counting_patches
+                    bmodel = BoundedModule(
+                        model, x_center, bound_opts={'conv_mode': 'patches'})
+                    results[name] = bmodel.compute_bounds(
+                        x=(BoundedTensor(x_center, ptb),), method='backward')
+                finally:
+                    PerturbationPWL._concretize_patches = fast_patches
+                    PerturbationPWL._concretize_matrix = fast_matrix
+            for fast, slow in zip(results['fast'], results['loop']):
+                self.assertTrue(
+                    torch.allclose(fast, slow, rtol=0, atol=1e-9),
+                    f"seed={seed}: max diff {(fast - slow).abs().max().item():.3e}")
+        self.assertGreater(calls['dense'], 0)
+        self.assertGreater(calls['sparse'], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
