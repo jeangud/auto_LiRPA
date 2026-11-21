@@ -727,15 +727,33 @@ class PerturbationPWL(Perturbation):
         U = torch.where(mask_U, U0, U1)
         return L, U
 
+    def _worst_at_breakpoints(self):
+        """Lowest value of L_i and highest value of U_i at their breakpoints.
+
+        The two pieces are only required to agree at the breakpoint up to a
+        tolerance (see the constructor). Piece 0 gives the value at the
+        breakpoint; piece 1 gives the limit from the right, which the bound
+        approaches for t just above the breakpoint (if any such t is in
+        the interval). Both count.
+
+        Returns:
+            L_bp, U_bp: each (B, D).
+        """
+        L_bp = self.pwl_lower_A[:, 0] * self.bp_lower + self.pwl_lower_b[:, 0]
+        L_right = self.pwl_lower_A[:, 1] * self.bp_lower + self.pwl_lower_b[:, 1]
+        U_bp = self.pwl_upper_A[:, 0] * self.bp_upper + self.pwl_upper_b[:, 0]
+        U_right = self.pwl_upper_A[:, 1] * self.bp_upper + self.pwl_upper_b[:, 1]
+        L_bp = torch.where(self.bp_lower < self.t_max, torch.min(L_bp, L_right), L_bp)
+        U_bp = torch.where(self.bp_upper < self.t_max, torch.max(U_bp, U_right), U_bp)
+        return L_bp, U_bp
+
     def _compute_concrete_bounds(self):
         """Concrete box bounds by evaluating at t_min, t_max, and each bp."""
         L_min, U_min = self._eval_at_t(self.t_min)
         L_max, U_max = self._eval_at_t(self.t_max)
 
         # For bp evaluation, each dim uses its own breakpoint value.
-        # L is naturally continuous at bp_lower (piece 0 == piece 1 there).
-        L_bp = self.pwl_lower_A[:, 0] * self.bp_lower + self.pwl_lower_b[:, 0]
-        U_bp = self.pwl_upper_A[:, 0] * self.bp_upper + self.pwl_upper_b[:, 0]
+        L_bp, U_bp = self._worst_at_breakpoints()
 
         x_L = torch.min(torch.min(L_min, L_bp), L_max)
         x_U = torch.max(torch.max(U_min, U_bp), U_max)
@@ -811,6 +829,14 @@ class PerturbationPWL(Perturbation):
         at every candidate t, instead of one pass over the D inputs per
         candidate. Sums are accumulated in double precision.
 
+        The pieces of a bound may differ at its breakpoint by the tolerance
+        the constructor allows, so g can jump there. Each candidate is
+        therefore evaluated twice: with the terms whose breakpoint equals t
+        still on piece 0 (the value at t), and with those terms on piece 1
+        (the limit from the right, approached for t just above). Between
+        consecutive breakpoints g is linear, so the best of these values is
+        the infimum (supremum) of g over the interval.
+
         Args:
             A: (B, H, D) dense backward coefficients.
             sign: -1 for lower, +1 for upper.
@@ -849,7 +875,13 @@ class PerturbationPWL(Perturbation):
         # Number of breakpoints strictly below each candidate: those terms
         # are on piece 1 (piece 0 applies for t <= bp, as in `_eval_at_t`)
         num_past = torch.searchsorted(bp_sorted, cand, right=False)
-        cand = cand.to(work).unsqueeze(1)                            # (B, 1, 2D+2)
+        # Limit from the right: the terms whose breakpoint equals the
+        # candidate are past it too. There is nothing to the right of t_max.
+        num_past_right = torch.where(
+            cand < ends[:, 1:],
+            torch.searchsorted(bp_sorted, cand, right=True), num_past)
+        num_past = torch.cat([num_past, num_past_right], dim=1)      # (B, 4D+4)
+        cand = torch.cat([cand, cand], dim=1).to(work).unsqueeze(1)  # (B, 1, 4D+4)
 
         best = A.new_empty(B, H)
         # Bound the size of the (B, rows, 2D) temporaries
@@ -876,7 +908,7 @@ class PerturbationPWL(Perturbation):
 
             index = num_past.unsqueeze(1).expand(-1, coef.shape[1], -1)
             values = (cand * (slope0 + torch.gather(slope, 2, index))
-                      + const0 + torch.gather(const, 2, index))      # (B, h, 2D+2)
+                      + const0 + torch.gather(const, 2, index))      # (B, h, 4D+4)
             if sign == -1:
                 best[:, start:start + rows] = values.min(dim=-1).values.to(A.dtype)
             else:
@@ -888,7 +920,8 @@ class PerturbationPWL(Perturbation):
         """Reference for `_concretize_matrix`: one pass per candidate t.
 
         Slow (2D+2 passes over the inputs); kept to test the vectorized
-        path against.
+        path against. It evaluates each breakpoint with piece 0 only, so it
+        is exact only for pieces that are continuous at their breakpoints.
         """
         B, H, D = A.shape
         if D == 1 and self.D > 1:
@@ -1083,8 +1116,7 @@ class PerturbationPWL(Perturbation):
         U_at_t0 = self.pwl_upper_A[:, 0] * t0 + self.pwl_upper_b[:, 0]
         U_at_t1 = self.pwl_upper_A[:, 1] * t1 + self.pwl_upper_b[:, 1]
 
-        L_at_bp_lower = self.pwl_lower_A[:, 0] * self.bp_lower + self.pwl_lower_b[:, 0]
-        U_at_bp_upper = self.pwl_upper_A[:, 0] * self.bp_upper + self.pwl_upper_b[:, 0]
+        L_at_bp_lower, U_at_bp_upper = self._worst_at_breakpoints()
 
         # Chord slope and intercept for lower bound (linear under-approx)
         lw = ((L_at_t1 - L_at_t0) / dt).unsqueeze(1)  # (B, 1, D)

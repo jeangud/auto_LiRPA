@@ -951,6 +951,61 @@ class TestPerturbationPWL(unittest.TestCase):
         self.assertGreater(calls['dense'], 0)
         self.assertGreater(calls['sparse'], 0)
 
+    @torch.no_grad()
+    def test_concretize_with_jump_at_breakpoint(self):
+        """Pieces may differ at the breakpoint by the constructor tolerance.
+        The bound must then cover the limit from the right of the breakpoint,
+        not only the value at it."""
+        D = 3
+        dtype = torch.float64
+        lower_A = torch.zeros(1, 2, D, dtype=dtype)
+        lower_b = torch.zeros(1, 2, D, dtype=dtype)
+        upper_A = torch.zeros(1, 2, D, dtype=dtype)
+        upper_b = torch.ones(1, 2, D, dtype=dtype)
+        lower_b[0, 1, 0] = -9e-5     # L_0 drops by 9e-5 right after t = 0.5
+        lower_A[0, :, 1] = 1.0       # L_1(t) = t
+        bp = torch.full((1, D), 0.5, dtype=dtype)
+        ptb = PerturbationPWL(
+            0.0, 1.0, lower_breakpoints=bp, upper_breakpoints=bp,
+            lower_A=lower_A, upper_A=upper_A, lower_b=lower_b, upper_b=upper_b)
+        A = torch.tensor([[[1.0, 1e-6, 0.0]]], dtype=dtype)
+        # inf over t of L_0(t) + 1e-6 * t: approached at t -> 0.5 from the right
+        expected = -9e-5 + 1e-6 * 0.5
+        self.assertAlmostEqual(float(ptb._concretize_matrix(A, -1)), expected, delta=1e-12)
+        self.assertAlmostEqual(float(ptb._concretize_matrix(-A, +1)), -expected, delta=1e-12)
+        # Concrete input bounds see the drop as well
+        self.assertAlmostEqual(float(ptb.x_L[0, 0]), -9e-5, delta=1e-12)
+
+    @torch.no_grad()
+    def test_concretize_with_jumps_bounds_every_parameter(self):
+        """With random jumps within the tolerance, no parameter value gives an
+        objective beyond the returned bound."""
+        B, H, D = 2, 5, 12
+        for seed in range(5):
+            ptb = self._random_pwl(B, D, torch.float64, seed)
+            g = torch.Generator().manual_seed(100 + seed)
+            # Break the continuity of piece 1, by up to 9e-5 either way
+            ptb.pwl_lower_b[:, 1] += (torch.rand(B, D, generator=g, dtype=torch.float64) - 0.5) * 1.8e-4
+            ptb.pwl_upper_b[:, 1] += (torch.rand(B, D, generator=g, dtype=torch.float64) - 0.5) * 1.8e-4
+            torch.manual_seed(seed)
+            A = torch.randn(B, H, D, dtype=torch.float64)
+            A_pos, A_neg = A.clamp(min=0), A.clamp(max=0)
+            # A fine grid, plus points just right of every breakpoint
+            just_right = torch.cat([ptb.bp_lower, ptb.bp_upper], dim=1).flatten() + 1e-12
+            just_right = just_right[just_right <= ptb.t_max]
+            grid = torch.cat([
+                torch.linspace(ptb.t_min, ptb.t_max, 2001, dtype=torch.float64), just_right])
+            low = ptb._concretize_matrix(A, -1)
+            high = ptb._concretize_matrix(A, +1)
+            x_L, x_U = ptb._compute_concrete_bounds()
+            for t in grid:
+                L, U = ptb._eval_at_t(t.item())
+                g_low = (A_pos * L.unsqueeze(1) + A_neg * U.unsqueeze(1)).sum(-1)
+                g_high = (A_pos * U.unsqueeze(1) + A_neg * L.unsqueeze(1)).sum(-1)
+                self.assertTrue((low <= g_low + 1e-9).all(), f"seed={seed} t={t.item()}")
+                self.assertTrue((high >= g_high - 1e-9).all(), f"seed={seed} t={t.item()}")
+                self.assertTrue((x_L <= L + 1e-12).all() and (x_U >= U - 1e-12).all())
+
 
 if __name__ == '__main__':
     unittest.main()
