@@ -94,6 +94,64 @@ def make_simple_pwl(B, D, t_min=0.0, t_max=1.0, seed=42):
     )
 
 
+def concretize_matrix_loop(ptb, A, sign):
+    """Reference for `PerturbationPWL._concretize_matrix`: one pass per candidate t.
+
+    Slow (2D+2 passes over the inputs). It evaluates each breakpoint with
+    piece 0 only, so it is exact only for pieces that are continuous at their
+    breakpoints.
+    """
+    B, H, D = A.shape
+    if D == 1 and ptb.D > 1:
+        # Forward mode concretization: A is the coefficient for the 1D scalar t
+        A_pos = A.clamp(min=0)
+        A_neg = A.clamp(max=0)
+        if sign == -1:
+            return (A_pos * ptb.t_min + A_neg * ptb.t_max).squeeze(-1)
+        else:
+            return (A_pos * ptb.t_max + A_neg * ptb.t_min).squeeze(-1)
+
+    A_pos = A.clamp(min=0)  # (B, H, D)
+    A_neg = A.clamp(max=0)  # (B, H, D)
+
+    def _bound_at_t(L, U):
+        """Given L,U of shape (B,D), compute bound(t) for all H."""
+        if sign == -1:
+            # min: pick L where A>=0, U where A<0
+            return (A_pos * L.unsqueeze(1) +
+                    A_neg * U.unsqueeze(1)).sum(dim=-1)  # (B, H)
+        else:
+            return (A_pos * U.unsqueeze(1) +
+                    A_neg * L.unsqueeze(1)).sum(dim=-1)
+
+    # Evaluate at t_min and t_max
+    L_min, U_min = ptb._eval_at_t(ptb.t_min)
+    L_max, U_max = ptb._eval_at_t(ptb.t_max)
+    best = _bound_at_t(L_min, U_min)
+    cand = _bound_at_t(L_max, U_max)
+    if sign == -1:
+        best = torch.min(best, cand)
+    else:
+        best = torch.max(best, cand)
+
+    # Evaluate at each per-dimension breakpoint (both lower and upper).
+    # bp_lower[:, d] / bp_upper[:, d] are candidate kinks for dim d. When we
+    # evaluate at t = bp_*[b, d], for OTHER dims j != d we re-evaluate L_j(t)
+    # and U_j(t) according to their own bp_lower_j / bp_upper_j masks. We
+    # process one candidate at a time to keep memory O(B*D).
+    for d in range(D):
+        for bp_tensor in (ptb.bp_lower, ptb.bp_upper):
+            t_d = bp_tensor[:, d]  # (B,)
+            L_d, U_d = ptb._eval_at_t(t_d)  # (B, D)
+            cand = _bound_at_t(L_d, U_d)
+            if sign == -1:
+                best = torch.min(best, cand)
+            else:
+                best = torch.max(best, cand)
+
+    return best
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Models
 # ──────────────────────────────────────────────────────────────────────
@@ -854,7 +912,7 @@ class TestPerturbationPWL(unittest.TestCase):
                 A[:, :, ::5] = 0.0
                 for sign in (-1, +1):
                     fast = ptb._concretize_matrix(A, sign)
-                    slow = ptb._concretize_matrix_loop(A, sign)
+                    slow = concretize_matrix_loop(ptb, A, sign)
                     self.assertEqual(fast.shape, slow.shape)
                     self.assertEqual(fast.dtype, slow.dtype)
                     self.assertTrue(
@@ -934,7 +992,7 @@ class TestPerturbationPWL(unittest.TestCase):
                         PerturbationPWL._concretize_patches = (
                             PerturbationPWL._concretize_patches_loop)
                         PerturbationPWL._concretize_matrix = (
-                            PerturbationPWL._concretize_matrix_loop)
+                            concretize_matrix_loop)
                     else:
                         PerturbationPWL._concretize_patches = counting_patches
                     bmodel = BoundedModule(
