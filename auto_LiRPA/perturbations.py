@@ -1092,6 +1092,205 @@ class PerturbationPWL(Perturbation):
                 f't_range=[{self.t_min:.4f}, {self.t_max:.4f}])')
 
 
+class PerturbationParamBox(Perturbation):
+    """Inputs bounded by two planes over a box of parameters.
+
+    Each input dimension x_i is bounded by
+        L_i(k) <= x_i <= U_i(k),    k in [param_lower, param_upper],
+    where k is a vector of P parameters shared by all the inputs and
+        L_i(k) = lower_A[b, i] . k + lower_b[b, i],
+        U_i(k) = upper_A[b, i] . k + upper_b[b, i].
+    The lower plane must not be above the upper plane anywhere in the box.
+
+    Concretization (backward mode). For a coefficient row A, the lower
+    bound is the minimum of A . x over the parameters and the inputs, that
+    is the minimum over the box of
+        f(k) = sum_i A+_i L_i(k) + A-_i U_i(k).
+    f is affine in k, f(k) = s . k + c, so its minimum is reached at the
+    corner of the box where every parameter is at its lower end if its
+    slope s_p is positive and at its upper end otherwise:
+        min f = c + sum_p min(s_p * param_lower_p, s_p * param_upper_p).
+    This is the exact minimum, not a relaxation. The upper bound is the
+    maximum of A+ U + A- L, at the opposite corner.
+
+    Each batch element has its own box and planes, so several boxes can be
+    bounded as one batch.
+
+    Args:
+        param_lower, param_upper: (B, P) corners of the box (lower <= upper).
+        lower_A, upper_A: (B, D, P) slopes of the planes.
+        lower_b, upper_b: (B, D) intercepts of the planes.
+    """
+
+    def __init__(self, param_lower, param_upper, *,
+                 lower_A, upper_A, lower_b, upper_b):
+        super(PerturbationParamBox, self).__init__()
+        if lower_A.ndim != 3:
+            raise ValueError(
+                f"lower_A must be 3-D (B, D, P), got shape {lower_A.shape}")
+        B, D, P = lower_A.shape
+        for name, tensor, shape in [
+                ('upper_A', upper_A, (B, D, P)),
+                ('lower_b', lower_b, (B, D)),
+                ('upper_b', upper_b, (B, D)),
+                ('param_lower', param_lower, (B, P)),
+                ('param_upper', param_upper, (B, P))]:
+            if tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
+        if not (param_lower <= param_upper).all():
+            raise ValueError("param_lower must be <= param_upper")
+
+        self.param_lower = param_lower          # (B, P)
+        self.param_upper = param_upper          # (B, P)
+        self.box_lower_A = lower_A              # (B, D, P)
+        self.box_upper_A = upper_A
+        self.box_lower_b = lower_b              # (B, D)
+        self.box_upper_b = upper_b
+        self.B, self.D, self.P = B, D, P
+
+        # Half the sum and half the difference of the upper and lower
+        # planes, as [slopes..., intercept]: (B, D, P + 1), double precision
+        lower = torch.cat([lower_A, lower_b.unsqueeze(-1)], dim=-1).double()
+        upper = torch.cat([upper_A, upper_b.unsqueeze(-1)], dim=-1).double()
+        self._mid = (upper + lower) / 2
+        self._rad = (upper - lower) / 2
+
+        # The gap U - L is affine: its minimum over the box is at a corner
+        gap = 2 * self._min_over_box(self._rad)
+        if not (gap >= -1e-6).all():
+            raise ValueError(
+                "The lower plane is above the upper plane in the box, "
+                f"max violation: {-gap.min().item()}")
+        self.x_L, self.x_U = self._compute_concrete_bounds()
+
+    # -----------------------------------------------------------------
+    # Internal helpers
+    # -----------------------------------------------------------------
+    def _min_over_box(self, affine):
+        """Minimum over the box of affine functions of the parameters.
+
+        Args:
+            affine: (B, N, P + 1) as [slopes..., intercept].
+        Returns:
+            (B, N).
+        """
+        slopes, const = affine[..., :-1], affine[..., -1]
+        lo = self.param_lower.to(affine.dtype).unsqueeze(1)     # (B, 1, P)
+        hi = self.param_upper.to(affine.dtype).unsqueeze(1)
+        return const + torch.minimum(slopes * lo, slopes * hi).sum(dim=-1)
+
+    def _compute_concrete_bounds(self):
+        """Concrete bounds of every input over the box: (B, D) each."""
+        lower = torch.cat(
+            [self.box_lower_A, self.box_lower_b.unsqueeze(-1)], dim=-1)
+        upper = torch.cat(
+            [self.box_upper_A, self.box_upper_b.unsqueeze(-1)], dim=-1)
+        return self._min_over_box(lower), -self._min_over_box(-upper)
+
+    def eval_at(self, params):
+        """Bounds of the inputs at given parameters.
+
+        Args:
+            params: (B, P) parameters.
+        Returns:
+            L, U: each (B, D).
+        """
+        params = params.unsqueeze(1)                            # (B, 1, P)
+        return ((self.box_lower_A * params).sum(dim=-1) + self.box_lower_b,
+                (self.box_upper_A * params).sum(dim=-1) + self.box_upper_b)
+
+    # -----------------------------------------------------------------
+    # Concretize (backward mode)
+    # -----------------------------------------------------------------
+    def concretize(self, x, A, sign=-1, aux=None):
+        """Concretize bounds given backward A matrix.
+
+        For sign=-1 (lower): compute min_{k,x} A·x  s.t. L(k)<=x<=U(k)
+        For sign=+1 (upper): compute max_{k,x} A·x  s.t. L(k)<=x<=U(k)
+        with k in the box.
+
+        Supports three A representations:
+          - torch.Tensor (dense matrix, shape (B, H, D))
+          - eyeC (identity matrix)
+          - Patches (sparse convolutional representation)
+
+        Args:
+            x: center input tensor (B, *input_shape).
+            A: backward coefficients — Tensor, eyeC, or Patches.
+            sign: -1 for lower, +1 for upper.
+        Returns:
+            bound: (B, H).
+        """
+        if A is None:
+            return None
+        if isinstance(A, eyeC) or (isinstance(A, Patches) and A.identity == 1):
+            bound = self.x_L if sign == -1 else self.x_U
+            return bound.reshape(bound.shape[0], -1)
+
+        affine = self._propagate_planes(x, A, sign)             # (B, H, P + 1)
+        # max g = -min(-g)
+        bound = self._min_over_box(affine if sign == -1 else -affine)
+        bound = bound if sign == -1 else -bound
+        out_dtype = A.patches.dtype if isinstance(A, Patches) else A.dtype
+        return bound.to(out_dtype)
+
+    def _propagate_planes(self, x, A, sign):
+        """A·x as an affine function of the parameters, on its worst side.
+
+        With mid and rad half the sum and half the difference of the upper
+        and lower planes,
+            A+ L + A- U = A mid - |A| rad      (sign=-1, smallest A·x)
+            A+ U + A- L = A mid + |A| rad      (sign=+1, largest A·x)
+        coefficient by coefficient.
+
+        Args:
+            x: center input tensor (B, *input_shape); used with Patches.
+            A: (B, H, D) Tensor, or Patches.
+            sign: -1 or +1.
+        Returns:
+            (B, H, P + 1) as [slopes..., intercept], in double precision.
+        """
+        mid, rad = self._mid, self._rad                         # (B, D, P + 1)
+        if isinstance(A, Patches):
+            if A.patches.dtype != mid.dtype:
+                A = A.create_similar(patches=A.patches.to(mid.dtype))
+            terms = []
+            for q in range(self.P + 1):
+                centre = A.matmul(mid[..., q].reshape(x.shape))
+                spread = A.matmul(rad[..., q].reshape(x.shape), patch_abs=True)
+                terms.append((centre + sign * spread).reshape(self.B, -1))
+            return torch.stack(terms, dim=-1)
+        A = A.to(mid.dtype)
+        B, H, D = A.shape
+        if D != self.D:
+            raise NotImplementedError(
+                "PerturbationParamBox supports backward mode only")
+        affine = A.new_empty(B, H, self.P + 1)
+        # Bound the size of the |A| temporary
+        rows = max(1, int(2 ** 24 // max(1, B * D)))
+        for start in range(0, H, rows):
+            A_c = A[:, start:start + rows]
+            affine[:, start:start + rows] = (
+                torch.einsum('bhd,bdq->bhq', A_c, mid)
+                + sign * torch.einsum('bhd,bdq->bhq', A_c.abs(), rad))
+        return affine
+
+    # -----------------------------------------------------------------
+    # Init
+    # -----------------------------------------------------------------
+    def init(self, x, aux=None, forward=False):
+        if forward:
+            raise NotImplementedError(
+                "PerturbationParamBox does not support forward mode.")
+        return LinearBound(
+            None, None, None, None,
+            self.x_L.reshape(x.shape), self.x_U.reshape(x.shape)), x, None
+
+    def __repr__(self):
+        return f'PerturbationParamBox(B={self.B}, D={self.D}, P={self.P})'
+
+
 class PerturbationSynonym(Perturbation):
     def __init__(self, budget, eps=1.0, use_simple=False):
         super(PerturbationSynonym, self).__init__()
